@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import cookieParser from "cookie-parser";
 import cors from "cors";
+import dns from "dns";
 import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
 import rateLimit from "express-rate-limit";
@@ -22,11 +23,19 @@ const bcryptSaltRounds = Number(process.env.BCRYPT_SALT_ROUNDS) || 12;
 const jwtExpiresIn = process.env.JWT_EXPIRES_IN || "7d";
 const stripeCurrency = process.env.STRIPE_CURRENCY || "bdt";
 const isProduction = process.env.NODE_ENV === "production";
+const dnsServers = (process.env.DNS_SERVERS || (!isProduction ? "8.8.8.8,1.1.1.1" : ""))
+  .split(",")
+  .map((server) => server.trim())
+  .filter(Boolean);
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 let mongoConnectionPromise: Promise<typeof mongoose> | null = null;
+
+if (dnsServers.length > 0) {
+  dns.setServers(dnsServers);
+}
 
 type ItemCategory =
   | "tools-equipment"
