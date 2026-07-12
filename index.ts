@@ -26,6 +26,7 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
+let mongoConnectionPromise: Promise<typeof mongoose> | null = null;
 
 type ItemCategory =
   | "tools-equipment"
@@ -231,14 +232,26 @@ function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
   }
 }
 
-async function connectMongo() {
+async function connectMongo(required = false) {
   if (!process.env.MONGO_URI) {
-    console.warn("MONGO_URI is not configured; database routes need it.");
+    const message = "MONGO_URI is not configured; database routes need it.";
+    if (required) throw new Error(message);
+    console.warn(message);
     return;
   }
-  if (mongoose.connection.readyState === 0) {
-    await mongoose.connect(process.env.MONGO_URI);
+
+  if (mongoose.connection.readyState === 1) return;
+  if (!mongoConnectionPromise || mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
+    mongoConnectionPromise = mongoose.connect(process.env.MONGO_URI);
+  }
+
+  try {
+    await mongoConnectionPromise;
     console.log("MongoDB connected");
+  } catch (error) {
+    mongoConnectionPromise = null;
+    if (required) throw error;
+    throw error;
   }
 }
 
@@ -258,12 +271,33 @@ app.use(
   }),
 );
 app.use(cookieParser());
+app.use(
+  "/api",
+  asyncHandler(async (req, res, next) => {
+    if (req.path === "/health") {
+      next();
+      return;
+    }
+
+    try {
+      await connectMongo(true);
+      next();
+    } catch {
+      res.status(503).json({ message: "Database connection is unavailable. Please try again shortly." });
+    }
+  }),
+);
 app.post(
   "/api/payments/webhook",
   express.raw({ type: "application/json" }),
   asyncHandler(async (req, res) => {
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      res.status(503).json({ message: "Stripe webhook is not configured" });
+    if (!stripe) {
+      res.json({ received: true, skipped: "Stripe is not configured" });
+      return;
+    }
+
+    if (!process.env.STRIPE_WEBHOOK_SECRET) {
+      res.json({ received: true, skipped: "Stripe webhook secret is not configured yet" });
       return;
     }
 
