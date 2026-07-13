@@ -264,7 +264,11 @@ async function connectMongo(required = false) {
   }
 }
 
-app.use(helmet());
+app.use(
+  helmet({
+    crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  }),
+);
 app.use(
   cors({
     origin: clientUrl,
