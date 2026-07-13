@@ -115,6 +115,7 @@ const paymentSchema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", required: true },
     item: { type: Schema.Types.ObjectId, ref: "RentalItem", required: true },
+    rentalRequest: { type: Schema.Types.ObjectId, ref: "RentalRequest" },
     rentalDays: { type: Number, required: true, min: 1 },
     dailyPrice: { type: Number, required: true, min: 1 },
     securityDeposit: { type: Number, required: true, min: 0 },
@@ -123,6 +124,24 @@ const paymentSchema = new Schema(
     currency: { type: String, required: true, default: "bdt" },
     stripeSessionId: { type: String, required: true, unique: true },
     paymentStatus: { type: String, enum: ["pending", "paid", "failed", "cancelled"], required: true, default: "pending" },
+  },
+  { timestamps: true },
+);
+
+const rentalRequestSchema = new Schema(
+  {
+    item: { type: Schema.Types.ObjectId, ref: "RentalItem", required: true },
+    renter: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    owner: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    rentalDays: { type: Number, required: true, min: 1 },
+    dailyPrice: { type: Number, required: true, min: 1 },
+    securityDeposit: { type: Number, required: true, min: 0 },
+    rentalAmount: { type: Number, required: true, min: 1 },
+    totalAmount: { type: Number, required: true, min: 1 },
+    status: { type: String, enum: ["pending", "accepted", "rejected", "cancelled", "paid"], required: true, default: "pending" },
+    renterMessage: { type: String, trim: true },
+    ownerNote: { type: String, trim: true },
+    payment: { type: Schema.Types.ObjectId, ref: "Payment" },
   },
   { timestamps: true },
 );
@@ -140,6 +159,7 @@ const contactMessageSchema = new Schema(
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 const RentalItemModel = mongoose.models.RentalItem || mongoose.model("RentalItem", rentalItemSchema);
 const Payment = mongoose.models.Payment || mongoose.model("Payment", paymentSchema);
+const RentalRequest = mongoose.models.RentalRequest || mongoose.model("RentalRequest", rentalRequestSchema);
 const ContactMessage = mongoose.models.ContactMessage || mongoose.model("ContactMessage", contactMessageSchema);
 
 const registerSchema = z
@@ -188,8 +208,20 @@ const contactSchema = z.object({
 });
 
 const checkoutSchema = z.object({
+  itemId: z.string().min(1).optional(),
+  requestId: z.string().min(1).optional(),
+  rentalDays: z.coerce.number().int().positive().optional(),
+});
+
+const rentalRequestCreateSchema = z.object({
   itemId: z.string().min(1),
   rentalDays: z.coerce.number().int().positive(),
+  renterMessage: z.string().max(500).optional(),
+});
+
+const rentalRequestStatusSchema = z.object({
+  status: z.enum(["accepted", "rejected"]),
+  ownerNote: z.string().max(500).optional(),
 });
 
 const adminRoleUpdateSchema = z.object({
@@ -382,6 +414,9 @@ app.post(
       );
       if (payment) {
         await RentalItemModel.findByIdAndUpdate(payment.item, { availability: "rented" });
+        if (payment.rentalRequest) {
+          await RentalRequest.findByIdAndUpdate(payment.rentalRequest, { status: "paid", payment: payment._id });
+        }
       }
     }
 
@@ -706,6 +741,105 @@ app.get(
   }),
 );
 
+app.post(
+  "/api/rental-requests",
+  authMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const data = rentalRequestCreateSchema.parse(req.body);
+    const item = await RentalItemModel.findById(data.itemId);
+    if (!item) {
+      res.status(404).json({ message: "Item not found" });
+      return;
+    }
+    if (item.availability !== "available") {
+      res.status(400).json({ message: "This item is not available for new rental requests" });
+      return;
+    }
+    if (String(item.owner) === req.user?.userId) {
+      res.status(400).json({ message: "You cannot request your own listing" });
+      return;
+    }
+
+    const rentalDays = Math.max(data.rentalDays, item.minimumRentalDays);
+    const rentalAmount = item.dailyPrice * rentalDays;
+    const totalAmount = rentalAmount + item.securityDeposit;
+    const rentalRequest = await RentalRequest.create({
+      item: item._id,
+      renter: req.user?.userId,
+      owner: item.owner,
+      rentalDays,
+      dailyPrice: item.dailyPrice,
+      securityDeposit: item.securityDeposit,
+      rentalAmount,
+      totalAmount,
+      renterMessage: data.renterMessage,
+      status: "pending",
+    });
+
+    res.status(201).json({ data: rentalRequest });
+  }),
+);
+
+app.get(
+  "/api/rental-requests/my",
+  authMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const requests = await RentalRequest.find({ renter: req.user?.userId })
+      .populate("item", "title slug images location category availability")
+      .populate("owner", "name email phone location")
+      .sort({ createdAt: -1 });
+    res.json({ data: requests });
+  }),
+);
+
+app.get(
+  "/api/rental-requests/owner",
+  authMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const requests = await RentalRequest.find({ owner: req.user?.userId })
+      .populate("item", "title slug images location category availability")
+      .populate("renter", "name email phone location avatar")
+      .sort({ createdAt: -1 });
+    res.json({ data: requests });
+  }),
+);
+
+app.patch(
+  "/api/rental-requests/:id/status",
+  authMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      res.status(400).json({ message: "Invalid request ID" });
+      return;
+    }
+
+    const data = rentalRequestStatusSchema.parse(req.body);
+    const rentalRequest = await RentalRequest.findById(req.params.id);
+    if (!rentalRequest) {
+      res.status(404).json({ message: "Rental request not found" });
+      return;
+    }
+    if (String(rentalRequest.owner) !== req.user?.userId) {
+      res.status(403).json({ message: "Only the owner can update this request" });
+      return;
+    }
+    if (rentalRequest.status !== "pending") {
+      res.status(400).json({ message: "Only pending requests can be updated" });
+      return;
+    }
+
+    rentalRequest.status = data.status;
+    rentalRequest.ownerNote = data.ownerNote;
+    await rentalRequest.save();
+
+    if (data.status === "accepted") {
+      await RentalItemModel.findByIdAndUpdate(rentalRequest.item, { availability: "unavailable" });
+    }
+
+    res.json({ data: rentalRequest });
+  }),
+);
+
 app.get(
   "/api/admin/users",
   authMiddleware,
@@ -776,7 +910,31 @@ app.post(
   authMiddleware,
   asyncHandler(async (req: AuthRequest, res) => {
     const data = checkoutSchema.parse(req.body);
-    const item = await RentalItemModel.findById(data.itemId);
+    let requestForPayment: any = null;
+    let item: any = null;
+    let rentalDays = data.rentalDays || 1;
+
+    if (data.requestId) {
+      requestForPayment = await RentalRequest.findById(data.requestId).populate("item");
+      if (!requestForPayment) {
+        res.status(404).json({ message: "Rental request not found" });
+        return;
+      }
+      if (String(requestForPayment.renter) !== req.user?.userId) {
+        res.status(403).json({ message: "You can pay only for your own request" });
+        return;
+      }
+      if (requestForPayment.status !== "accepted") {
+        res.status(400).json({ message: "Owner must accept this request before payment" });
+        return;
+      }
+      item = requestForPayment.item;
+      rentalDays = requestForPayment.rentalDays;
+    } else if (data.itemId) {
+      res.status(400).json({ message: "Send a rental request and wait for owner approval before payment" });
+      return;
+    }
+
     if (!item) {
       res.status(404).json({ message: "Item not found" });
       return;
@@ -786,8 +944,8 @@ app.post(
       return;
     }
 
-    const rentalAmount = item.dailyPrice * data.rentalDays;
-    const totalAmount = rentalAmount + item.securityDeposit;
+    const rentalAmount = requestForPayment?.rentalAmount ?? item.dailyPrice * rentalDays;
+    const totalAmount = requestForPayment?.totalAmount ?? rentalAmount + item.securityDeposit;
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       payment_method_types: ["card"],
@@ -803,13 +961,14 @@ app.post(
       ],
       success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${clientUrl}/payment/cancel`,
-      metadata: { itemId: String(item._id), userId: String(req.user?.userId), rentalDays: String(data.rentalDays) },
+      metadata: { itemId: String(item._id), userId: String(req.user?.userId), rentalDays: String(rentalDays), requestId: data.requestId || "" },
     });
 
-    await Payment.create({
+    const payment = await Payment.create({
       user: req.user?.userId,
       item: item._id,
-      rentalDays: data.rentalDays,
+      rentalRequest: requestForPayment?._id,
+      rentalDays,
       dailyPrice: item.dailyPrice,
       securityDeposit: item.securityDeposit,
       rentalAmount,
@@ -818,6 +977,11 @@ app.post(
       stripeSessionId: session.id,
       paymentStatus: "pending",
     });
+
+    if (requestForPayment) {
+      requestForPayment.payment = payment._id;
+      await requestForPayment.save();
+    }
 
     res.status(201).json({ data: { sessionId: session.id, checkoutUrl: session.url } });
   }),
