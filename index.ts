@@ -1020,8 +1020,35 @@ connectMongo().catch((error: unknown) => {
   console.error(message);
 });
 
+async function ensureDemoAccount() {
+  try {
+    const existingDemo = await User.findOne({ email: "demo@sharebari.com" });
+    if (!existingDemo) {
+      const hashedPassword = await bcrypt.hash("DemoPassword123", bcryptSaltRounds);
+      await User.create({
+        name: "Demo User",
+        email: "demo@sharebari.com",
+        phone: "+880 1700 000000",
+        location: "Dhaka, Bangladesh",
+        password: hashedPassword,
+        authProvider: "local",
+        role: "user",
+        avatar: "https://api.dicebear.com/7.x/avataaars/svg?seed=demo",
+      });
+      console.log("✓ Demo account created");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("duplicate")) {
+      // Demo account already exists
+    } else {
+      console.error("Error creating demo account:", error);
+    }
+  }
+}
+
 if (process.env.VERCEL !== "1") {
-  app.listen(port, () => {
+  app.listen(port, async () => {
+    await ensureDemoAccount();
     console.log(`ShareBari server listening on port ${port}`);
   });
 }
