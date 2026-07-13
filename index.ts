@@ -260,12 +260,28 @@ function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
 }
 
 function adminMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
-  if (req.user?.role !== "admin") {
-    res.status(403).json({ message: "Admin access required" });
-    return;
-  }
+  User.findById(req.user?.userId)
+    .then(async (user) => {
+      if (!user) {
+        res.status(403).json({ message: "Admin access required" });
+        return;
+      }
 
-  next();
+      const preferredRole = roleForEmail(user.email, user.role);
+      if (preferredRole === "admin" && user.role !== "admin") {
+        user.role = "admin";
+        await user.save();
+      }
+
+      if (user.role !== "admin") {
+        res.status(403).json({ message: "Admin access required" });
+        return;
+      }
+
+      if (req.user) req.user.role = "admin";
+      next();
+    })
+    .catch(next);
 }
 
 async function connectMongo(required = false) {
