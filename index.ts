@@ -148,12 +148,21 @@ const registerSchema = z
     email: z.string().email(),
     phone: z.string().optional(),
     location: z.string().optional(),
+    avatar: z.string().url().optional().or(z.literal("")),
     password: z.string().min(6),
     confirmPassword: z.string().min(6),
   })
   .refine((data) => data.password === data.confirmPassword, { message: "Passwords do not match", path: ["confirmPassword"] });
 
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
+
+const profileUpdateSchema = z.object({
+  name: z.string().min(2),
+  email: z.string().email(),
+  phone: z.string().optional(),
+  location: z.string().optional(),
+  avatar: z.string().url().optional().or(z.literal("")),
+});
 
 const itemCreateSchema = z.object({
   title: z.string().min(3),
@@ -419,6 +428,7 @@ app.post(
       email: data.email.toLowerCase(),
       phone: data.phone,
       location: data.location,
+      avatar: data.avatar || undefined,
       password: hashedPassword,
       authProvider: "local",
       role,
@@ -504,6 +514,38 @@ app.get(
   authMiddleware,
   asyncHandler(async (req: AuthRequest, res) => {
     const user = await User.findById(req.user?.userId);
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    res.json({ data: toSafeUser(user) });
+  }),
+);
+
+app.patch(
+  "/api/auth/me",
+  authMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const data = profileUpdateSchema.parse(req.body);
+    const email = data.email.toLowerCase();
+    const existingUser = await User.findOne({ email, _id: { $ne: req.user?.userId } });
+    if (existingUser) {
+      res.status(409).json({ message: "Email is already used by another account" });
+      return;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user?.userId,
+      {
+        name: data.name,
+        email,
+        phone: data.phone,
+        location: data.location,
+        avatar: data.avatar || undefined,
+      },
+      { new: true },
+    );
     if (!user) {
       res.status(404).json({ message: "User not found" });
       return;
