@@ -48,12 +48,14 @@ type ItemCategory =
 type JwtPayload = {
   userId: string;
   email: string;
-  role: "user";
+  role: UserRole;
 };
 
 type AuthRequest = Request & {
   user?: JwtPayload;
 };
+
+type UserRole = "user" | "admin";
 
 const itemCategories: ItemCategory[] = [
   "tools-equipment",
@@ -65,6 +67,11 @@ const itemCategories: ItemCategory[] = [
 ];
 const conditions = ["like-new", "excellent", "good", "fair"] as const;
 const availabilities = ["available", "rented", "unavailable"] as const;
+const userRoles = ["user", "admin"] as const;
+const adminEmails = (process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
 
 const userSchema = new Schema(
   {
@@ -75,7 +82,7 @@ const userSchema = new Schema(
     password: { type: String, select: false },
     googleId: { type: String },
     authProvider: { type: String, enum: ["local", "google"], required: true, default: "local" },
-    role: { type: String, enum: ["user"], required: true, default: "user" },
+    role: { type: String, enum: userRoles, required: true, default: "user" },
     avatar: { type: String },
   },
   { timestamps: true },
@@ -176,6 +183,10 @@ const checkoutSchema = z.object({
   rentalDays: z.coerce.number().int().positive(),
 });
 
+const adminRoleUpdateSchema = z.object({
+  role: z.enum(userRoles),
+});
+
 function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => {
     fn(req, res, next).catch(next);
@@ -191,6 +202,10 @@ function signToken(payload: JwtPayload) {
   const secret = process.env.JWT_SECRET;
   if (!secret) throw new Error("JWT_SECRET is not configured");
   return jwt.sign(payload, secret, { expiresIn: jwtExpiresIn as jwt.SignOptions["expiresIn"] });
+}
+
+function roleForEmail(email: string, fallback: UserRole = "user"): UserRole {
+  return adminEmails.includes(email.toLowerCase()) ? "admin" : fallback;
 }
 
 function setAuthCookie(res: Response, token: string) {
@@ -225,7 +240,10 @@ function toSafeUser(user: any) {
 }
 
 function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
-  const token = req.cookies?.[cookieName];
+  const bearerToken = req.headers.authorization?.startsWith("Bearer ")
+    ? req.headers.authorization.slice("Bearer ".length)
+    : "";
+  const token = req.cookies?.[cookieName] || bearerToken;
   if (!token) {
     res.status(401).json({ message: "Authentication required" });
     return;
@@ -239,6 +257,15 @@ function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
   } catch {
     res.status(401).json({ message: "Invalid or expired token" });
   }
+}
+
+function adminMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
+  if (req.user?.role !== "admin") {
+    res.status(403).json({ message: "Admin access required" });
+    return;
+  }
+
+  next();
 }
 
 async function connectMongo(required = false) {
@@ -370,6 +397,7 @@ app.post(
     }
 
     const hashedPassword = await bcrypt.hash(data.password, bcryptSaltRounds);
+    const role = roleForEmail(data.email);
     const user = await User.create({
       name: data.name,
       email: data.email.toLowerCase(),
@@ -377,11 +405,11 @@ app.post(
       location: data.location,
       password: hashedPassword,
       authProvider: "local",
-      role: "user",
+      role,
     });
-    const token = signToken({ userId: String(user._id), email: user.email, role: "user" });
+    const token = signToken({ userId: String(user._id), email: user.email, role: user.role });
     setAuthCookie(res, token);
-    res.status(201).json({ data: toSafeUser(user) });
+    res.status(201).json({ data: toSafeUser(user), token });
   }),
 );
 
@@ -401,9 +429,14 @@ app.post(
       return;
     }
 
-    const token = signToken({ userId: String(user._id), email: user.email, role: "user" });
+    const preferredRole = roleForEmail(user.email, user.role);
+    if (preferredRole !== user.role) {
+      user.role = preferredRole;
+      await user.save();
+    }
+    const token = signToken({ userId: String(user._id), email: user.email, role: user.role });
     setAuthCookie(res, token);
-    res.json({ data: toSafeUser(user) });
+    res.json({ data: toSafeUser(user), token });
   }),
 );
 
@@ -423,23 +456,25 @@ app.post(
       return;
     }
 
+    const role = roleForEmail(payload.email);
     const user = await User.findOneAndUpdate(
       { email: payload.email.toLowerCase() },
       {
+        ...(role === "admin" ? { role } : {}),
         $setOnInsert: {
           name: payload.name || payload.email,
           email: payload.email.toLowerCase(),
           googleId: payload.sub,
           avatar: payload.picture,
           authProvider: "google",
-          role: "user",
+          role,
         },
       },
       { new: true, upsert: true },
     );
-    const token = signToken({ userId: String(user._id), email: user.email, role: "user" });
+    const token = signToken({ userId: String(user._id), email: user.email, role: user.role });
     setAuthCookie(res, token);
-    res.json({ data: toSafeUser(user) });
+    res.json({ data: toSafeUser(user), token });
   }),
 );
 
@@ -610,6 +645,62 @@ app.get(
         byAvailability,
       },
     });
+  }),
+);
+
+app.get(
+  "/api/admin/users",
+  authMiddleware,
+  adminMiddleware,
+  asyncHandler(async (_req: AuthRequest, res) => {
+    const [users, listingCounts, totalItems, totalPayments] = await Promise.all([
+      User.find().sort({ createdAt: -1 }),
+      RentalItemModel.aggregate([{ $group: { _id: "$owner", listedItems: { $sum: 1 } } }]),
+      RentalItemModel.countDocuments(),
+      Payment.countDocuments(),
+    ]);
+    const listingCountMap = new Map(listingCounts.map((item) => [String(item._id), item.listedItems]));
+    const safeUsers = users.map((user) => ({
+      ...toSafeUser(user),
+      listedItems: listingCountMap.get(String(user._id)) || 0,
+    }));
+
+    res.json({
+      data: safeUsers,
+      summary: {
+        totalUsers: users.length,
+        adminUsers: users.filter((user) => user.role === "admin").length,
+        regularUsers: users.filter((user) => user.role !== "admin").length,
+        totalItems,
+        totalPayments,
+      },
+    });
+  }),
+);
+
+app.patch(
+  "/api/admin/users/:id/role",
+  authMiddleware,
+  adminMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      res.status(400).json({ message: "Invalid user ID" });
+      return;
+    }
+
+    const data = adminRoleUpdateSchema.parse(req.body);
+    if (req.params.id === req.user?.userId && data.role !== "admin") {
+      res.status(400).json({ message: "You cannot remove your own admin access" });
+      return;
+    }
+
+    const user = await User.findByIdAndUpdate(req.params.id, { role: data.role }, { new: true });
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    res.json({ data: toSafeUser(user) });
   }),
 );
 
