@@ -184,20 +184,33 @@ const profileUpdateSchema = z.object({
   avatar: z.string().url().optional().or(z.literal("")),
 });
 
+const optionalText = z.preprocess(
+  (value) => typeof value === "string" && value.trim() === "" ? undefined : value,
+  z.string().trim().optional(),
+);
+
+const itemImageSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => /^(https?:\/\/|data:image\/|\/)/i.test(value), {
+    message: "Image must be a valid upload URL",
+  });
+
 const itemCreateSchema = z.object({
-  title: z.string().min(3),
-  shortDescription: z.string().min(10),
-  fullDescription: z.string().min(20),
+  title: z.string().trim().min(3),
+  shortDescription: z.string().trim().min(10),
+  fullDescription: z.string().trim().min(20),
   category: z.enum(itemCategories as [ItemCategory, ...ItemCategory[]]),
   dailyPrice: z.coerce.number().positive(),
   securityDeposit: z.coerce.number().min(0),
-  location: z.string().min(2),
+  location: z.string().trim().min(2),
   condition: z.enum(conditions),
   availability: z.enum(availabilities).default("available"),
-  brand: z.string().optional(),
-  model: z.string().optional(),
+  brand: optionalText,
+  model: optionalText,
   minimumRentalDays: z.coerce.number().int().positive().default(1),
-  images: z.array(z.string().url()).min(1).max(3),
+  images: z.array(itemImageSchema).min(1).max(3),
 });
 
 const itemUpdateSchema = itemCreateSchema.partial().refine((data) => Object.keys(data).length > 0, {
@@ -1043,7 +1056,11 @@ app.use((_req: Request, res: Response) => {
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (error instanceof z.ZodError) {
-    res.status(400).json({ message: "Validation failed", issues: error.issues });
+    const details = error.issues.map((issue) => {
+      const field = issue.path.length > 0 ? issue.path.join(".") : "request";
+      return `${field}: ${issue.message}`;
+    });
+    res.status(400).json({ message: details.length > 0 ? `Validation failed - ${details.join("; ")}` : "Validation failed", issues: error.issues });
     return;
   }
 
