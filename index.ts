@@ -200,6 +200,10 @@ const itemCreateSchema = z.object({
   images: z.array(z.string().url()).min(1).max(3),
 });
 
+const itemUpdateSchema = itemCreateSchema.partial().refine((data) => Object.keys(data).length > 0, {
+  message: "At least one item field is required",
+});
+
 const contactSchema = z.object({
   name: z.string().min(2),
   email: z.string().email(),
@@ -687,6 +691,38 @@ app.get(
       return;
     }
 
+    res.json({ data: item });
+  }),
+);
+
+app.patch(
+  "/api/items/:id",
+  authMiddleware,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      res.status(400).json({ message: "Invalid item ID" });
+      return;
+    }
+
+    const data = itemUpdateSchema.parse(req.body);
+    const item = await RentalItemModel.findById(req.params.id);
+    if (!item) {
+      res.status(404).json({ message: "Item not found" });
+      return;
+    }
+    if (String(item.owner) !== req.user?.userId) {
+      res.status(403).json({ message: "You can update only your own listings" });
+      return;
+    }
+
+    const titleChanged = Boolean(data.title && data.title !== item.title);
+    Object.assign(item, data);
+    if (titleChanged && data.title) {
+      item.slug = createSlug(data.title);
+    }
+
+    await item.save();
+    await item.populate("owner", "name email phone location");
     res.json({ data: item });
   }),
 );
